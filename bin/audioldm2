@@ -2,7 +2,7 @@
 import os
 import torch
 import logging
-from audioldm2 import text_to_audio, super_resolution_and_inpainting, build_model, save_wave, get_time, read_list
+from audioldm2 import text_to_audio, super_resolution_and_inpainting, style_transfer, build_model, save_wave, get_time, read_list
 import argparse
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -10,15 +10,6 @@ matplotlib_logger = logging.getLogger('matplotlib')
 matplotlib_logger.setLevel(logging.WARNING)
 
 parser = argparse.ArgumentParser()
-
-parser.add_argument(
-    "--mode",
-    type=str,
-    required=False,
-    default="generation",
-    help="{generation,sr_inpainting} generation: text-to-audio generation; sr_inpainting: super resolution inpainting",
-    choices=["generation", "sr_inpainting"]
-)
 
 parser.add_argument(
     "-t",
@@ -44,6 +35,15 @@ parser.add_argument(
     required=False,
     default="",
     help="Transcription for Text-to-Speech",
+)
+
+parser.add_argument(
+    "--mode",
+    type=str,
+    required=False,
+    default="generation",
+    help="{generation,sr_inpainting,style_transfer} generation: text-to-audio generation; sr_inpainting: super resolution inpainting; style_transfer: text-guided audio-to-audio",
+    choices=["generation", "sr_inpainting", "style_transfer"]
 )
 
 parser.add_argument(
@@ -106,6 +106,14 @@ parser.add_argument(
     required=False,
     default=3.5,
     help="Guidance scale (Large => better quality and relavancy to text; Small => better diversity)",
+)
+
+parser.add_argument(
+    "--transfer_strength",
+    type=float,
+    required=False,
+    default=0.5,
+    help="(style_transfer) Strength of text-guided transfer. 0 keeps the source, 1 follows the text.",
 )
 
 parser.add_argument(
@@ -211,6 +219,22 @@ for text in prompt_todo:
             duration=duration,
             guidance_scale=guidance_scale,
             n_candidate_gen_per_text=n_candidate_gen_per_text,
+            ddim_steps=args.ddim_steps,
+            batchsize=args.batchsize,
+            latent_t_per_second=latent_t_per_second
+        )
+    elif(args.mode == "style_transfer"):
+        assert args.file_path is not None
+        assert os.path.exists(args.file_path), "The original audio file \'%s\' for style transfer does not exist." % args.file_path
+        waveform = style_transfer(
+            latent_diffusion=audioldm2,
+            text=text,
+            transcription=transcription,
+            original_audio_file_path=args.file_path,
+            transfer_strength=args.transfer_strength,
+            seed=random_seed,
+            duration=duration,
+            guidance_scale=guidance_scale,
             ddim_steps=args.ddim_steps,
             batchsize=args.batchsize,
             latent_t_per_second=latent_t_per_second

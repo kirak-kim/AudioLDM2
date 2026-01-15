@@ -1,14 +1,16 @@
 import os
 import re
 
+import contextlib
 import yaml
 import torch
 import torchaudio
 
 import audioldm2.latent_diffusion.modules.phoneme_encoder.text as text
+from audioldm2.latent_diffusion.models.ddim import DDIMSampler
 from audioldm2.latent_diffusion.models.ddpm import LatentDiffusion
 from audioldm2.latent_diffusion.util import get_vits_phoneme_ids_no_padding
-from audioldm2.utils import default_audioldm_config, download_checkpoint
+from audioldm2.utils import default_audioldm_config, download_checkpoint, get_bit_depth, get_duration
 from audioldm2.utilities.audio.stft import TacotronSTFT
 from audioldm2.utilities.audio.tools import wav_to_fbank
 import os
@@ -92,12 +94,18 @@ def make_batch_for_text_to_audio(text, transcription="", waveform=None, fbank=No
         fbank = torch.zeros(
             (batchsize, 1024, 64)
         )  # Not used, here to keep the code format
+        fbank_len = fbank.size(1)
     else:
         fbank = torch.FloatTensor(fbank)
-        fbank = fbank.expand(batchsize, 1024, 64)
-        assert fbank.size(0) == batchsize
+        if fbank.dim() == 2:
+            fbank = fbank.unsqueeze(0)
+        if fbank.size(0) == 1 and batchsize > 1:
+            fbank = fbank.expand(batchsize, -1, -1)
+        else:
+            assert fbank.size(0) == batchsize
+        fbank_len = fbank.size(1)
 
-    stft = torch.zeros((batchsize, 1024, 512))  # Not used
+    stft = torch.zeros((batchsize, fbank_len, 512))  # Not used
     phonemes = get_vits_phoneme_ids_no_padding(transcription)
 
     if waveform is None:
@@ -264,4 +272,116 @@ def super_resolution_and_inpainting(
             time_mask_ratio_start_and_end=time_mask_ratio_start_and_end,
             freq_mask_ratio_start_and_end=freq_mask_ratio_start_and_end
         )
+    return waveform
+
+def style_transfer(
+    latent_diffusion,
+    text,
+    original_audio_file_path,
+    transfer_strength,
+    transcription="",
+    seed=42,
+    duration=10,
+    batchsize=1,
+    guidance_scale=2.5,
+    ddim_steps=200,
+    latent_t_per_second=25.6,
+    config=None,
+):
+    if original_audio_file_path is None:
+        raise ValueError("You need to provide the original audio file path")
+    if not os.path.exists(original_audio_file_path):
+        raise FileNotFoundError(
+            "The original audio file '%s' does not exist." % original_audio_file_path
+        )
+
+    audio_file_duration = get_duration(original_audio_file_path)
+    if get_bit_depth(original_audio_file_path) != 16:
+        raise AssertionError(
+            "The bit depth of the original audio file %s must be 16"
+            % original_audio_file_path
+        )
+
+    if duration > audio_file_duration:
+        print(
+            "Warning: Duration you specified %s-seconds must equal or smaller than the audio file duration %ss"
+            % (duration, audio_file_duration)
+        )
+        duration = round_up_duration(audio_file_duration)
+        print("Set new duration as %s-seconds" % duration)
+
+    seed_everything(int(seed))
+    latent_diffusion.latent_t_size = int(duration * latent_t_per_second)
+    latent_diffusion = set_cond_text(latent_diffusion)
+
+    if config is not None:
+        assert type(config) is str
+        config = yaml.load(open(config, "r"), Loader=yaml.FullLoader)
+    else:
+        config = default_audioldm_config()
+
+    fn_STFT = TacotronSTFT(
+        config["preprocessing"]["stft"]["filter_length"],
+        config["preprocessing"]["stft"]["hop_length"],
+        config["preprocessing"]["stft"]["win_length"],
+        config["preprocessing"]["mel"]["n_mel_channels"],
+        config["preprocessing"]["audio"]["sampling_rate"],
+        config["preprocessing"]["mel"]["mel_fmin"],
+        config["preprocessing"]["mel"]["mel_fmax"],
+    )
+
+    mel, _, _ = wav_to_fbank(
+        original_audio_file_path, target_length=int(duration * 102.4), fn_STFT=fn_STFT
+    )
+
+    batch = make_batch_for_text_to_audio(
+        text, transcription=transcription, fbank=mel[None, ...], batchsize=batchsize
+    )
+    init_latent, cond = latent_diffusion.get_input(
+        batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=0.0
+    )
+    cond = latent_diffusion.filter_useful_cond_dict(cond)
+
+    if torch.max(torch.abs(init_latent)) > 1e2:
+        init_latent = torch.clamp(init_latent, min=-10, max=10)
+
+    transfer_strength = max(0.0, min(1.0, float(transfer_strength)))
+    t_enc = int(transfer_strength * ddim_steps)
+
+    sampler = DDIMSampler(latent_diffusion, device=latent_diffusion.device)
+    sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=1.0, verbose=False)
+
+    uc = None
+    if guidance_scale != 1.0:
+        uc = {}
+        for key in latent_diffusion.cond_stage_model_metadata:
+            model_idx = latent_diffusion.cond_stage_model_metadata[key]["model_idx"]
+            uc[key] = latent_diffusion.cond_stage_models[
+                model_idx
+            ].get_unconditional_condition(batchsize)
+
+    device = latent_diffusion.device
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    init_latent = init_latent.to(device)
+    time_steps = torch.tensor([t_enc] * batchsize).to(device)
+
+    autocast_ctx = contextlib.nullcontext()
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        autocast_ctx = torch.cuda.amp.autocast()
+
+    with torch.no_grad():
+        with autocast_ctx:
+            z_enc = sampler.stochastic_encode(init_latent, time_steps)
+            samples = sampler.decode(
+                z_enc,
+                cond,
+                t_enc,
+                unconditional_guidance_scale=guidance_scale,
+                unconditional_conditioning=uc,
+            )
+            mel = latent_diffusion.decode_first_stage(samples)
+            waveform = latent_diffusion.mel_spectrogram_to_waveform(mel, save=False)
+
     return waveform

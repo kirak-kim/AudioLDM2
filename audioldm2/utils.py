@@ -5,6 +5,7 @@ from huggingface_hub import hf_hub_download
 from inspect import isfunction
 import os
 import soundfile as sf
+import numpy as np
 import time
 import wave
 
@@ -51,6 +52,13 @@ def seed_everything(seed):
 
 
 def save_wave(waveform, savepath, name="outwav", samplerate=16000):
+    try:
+        import torch
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.detach().cpu().numpy()
+    except ImportError:
+        pass
+
     if type(name) is not list:
         name = [name] * waveform.shape[0]
 
@@ -72,7 +80,10 @@ def save_wave(waveform, savepath, name="outwav", samplerate=16000):
             savepath, fname
         )
         print("Save audio to %s" % path)
-        sf.write(path, waveform[i, 0], samplerate=samplerate)
+        audio = waveform[i, 0]
+        if isinstance(audio, np.ndarray) and audio.dtype == np.float16:
+            audio = audio.astype(np.float32)
+        sf.write(path, audio, samplerate=samplerate)
 
 
 def exists(x):
